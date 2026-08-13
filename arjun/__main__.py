@@ -108,6 +108,7 @@ def detect_chunk_size(request, factors):
         start = _time.time()
         response = requester(request, test_params)
         elapsed = _time.time() - start
+        elapsed -= mem.var.get('delay', 0)
 
         if type(response) == str:
             chunk_size = max(chunk_size // 2, 8)
