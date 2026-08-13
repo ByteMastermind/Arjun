@@ -10,7 +10,7 @@ from urllib.parse import urlparse
 import arjun.core.config as mem
 from arjun.core.exporter import exporter
 from arjun.core.anomaly import define, compare
-from arjun.core.utils import fetch_params, stable_request, random_str, slicer, confirm, populate, reader, nullify, prepare_requests, compatible_path
+from arjun.core.utils import fetch_params, stable_request, random_str, slicer, populate, reader, nullify, prepare_requests, compatible_path
 
 from arjun.plugins.heuristic import heuristic
 from arjun.plugins.wl import detect_casing, covert_to_case
@@ -29,7 +29,7 @@ parser.add_argument('-w', help='Wordlist file path. (default: {arjundir}/db/larg
 parser.add_argument('-m', help='Request method to use: GET/POST/XML/JSON. (default: GET)', dest='method', default='GET')
 parser.add_argument('-i', help='Import target URLs from file.', dest='import_file', nargs='?', const=True)
 parser.add_argument('-T', help='HTTP request timeout in seconds. (default: 15)', dest='timeout', type=float, default=15)
-parser.add_argument('-c', help='Chunk size. The number of parameters to be sent at once', type=int, dest='chunks', default=250)
+parser.add_argument('-c', help='Chunk size. The number of parameters to be sent at once (auto-detected if not set)', type=int, dest='chunks', default=None)
 parser.add_argument('-q', help='Quiet mode. No output.', dest='quiet', action='store_true')
 parser.add_argument('--rate-limit', help='Max number of requests to be sent out per second (default: 9999)', dest='rate_limit', type=int, default=9999)
 parser.add_argument('--headers', help='Add headers. Separate multiple headers with a new line.', dest='headers', nargs='?', const=True)
@@ -37,6 +37,7 @@ parser.add_argument('--passive', help='Collect parameter names from passive sour
 parser.add_argument('--stable', help='Prefer stability over speed.', dest='stable', action='store_true')
 parser.add_argument('--include', help='Include this data in every request.', dest='include', default={})
 parser.add_argument('--disable-redirects', help='disable redirects', dest='disable_redirects', action='store_true')
+parser.add_argument('--no-cache-bust', help='Disable cache busting (random query param per request)', dest='no_cache_bust', action='store_true')
 parser.add_argument('--casing', help='casing style for params e.g. like_this, likeThis, likethis', dest='casing')
 args = parser.parse_args() # arguments to be parsed
 
@@ -58,9 +59,6 @@ except ImportError:
 mem.var = vars(args)
 
 mem.var['method'] = mem.var['method'].upper()
-
-if mem.var['method'] != 'GET':
-    mem.var['chunks'] = 500
 
 if mem.var['stable'] or mem.var['delay']:
     mem.var['threads'] = 1
@@ -87,30 +85,68 @@ try:
 except FileNotFoundError:
     exit('%s The specified file for parameters doesn\'t exist' % bad)
 
-if len(wordlist) < mem.var['chunks']:
-    mem.var['chunks'] = int(len(wordlist)/2)
-
 if not args.url and not args.import_file:
     exit('%s No target(s) specified' % bad)
 
 from arjun.core.requester import requester
 from arjun.core.bruter import bruter
 
+import time as _time
+
+
+def detect_chunk_size(request, factors):
+    """
+    Auto-detects optimal params-per-chunk by probing with increasing sizes.
+    Doubles chunk size until the server rejects or response is too slow.
+    """
+    chunk_size = 16
+    max_size = 512
+
+    while chunk_size <= max_size:
+        test_params = {random_str(8): random_str(6) for _ in range(chunk_size)}
+
+        start = _time.time()
+        response = requester(request, test_params)
+        elapsed = _time.time() - start
+
+        if type(response) == str:
+            chunk_size = max(chunk_size // 2, 8)
+            break
+
+        result = compare(response, factors, test_params)
+        if result[0]:
+            chunk_size = max(chunk_size // 2, 8)
+            break
+
+        if elapsed > 5:
+            chunk_size = max(chunk_size // 2, 8)
+            break
+
+        if chunk_size >= max_size:
+            break
+
+        chunk_size *= 2
+
+    return min(chunk_size, max_size)
+
+
 def narrower(request, factors, param_groups):
     """
-    takes a list of parameters and narrows it down to parameters that cause anomalies
-    returns list
+    sends parameter chunks to thread pool; each thread binary-searches internally
+    returns list of single-param dicts
     """
-    anomalous_params = []
+    found_params = []
     threadpool = ThreadPoolExecutor(max_workers=mem.var['threads'])
     futures = (threadpool.submit(bruter, request, factors, params) for params in param_groups)
     for i, result in enumerate(as_completed(futures)):
-        if result.result():
-            anomalous_params.extend(slicer(result.result()))
+        result_val = result.result()
+        if result_val:
+            found_params.extend(result_val)
         if mem.var['kill']:
-            return anomalous_params
+            threadpool.shutdown(wait=False)
+            return found_params
         print('%s Processing chunks: %i/%-6i' % (info, i + 1, len(param_groups)), end='\r')
-    return anomalous_params
+    return found_params
 
 
 def initialize(request, wordlist, single_url=False):
@@ -141,17 +177,18 @@ def initialize(request, wordlist, single_url=False):
         if type(response_1) == str or type(response_2) == str:
             return 'skipped'
 
-        # params from response must be extracted before factors but displayed later
         found, words_exist = heuristic(response_1, wordlist)
 
         factors = define(response_1, response_2, fuzz, fuzz[::-1], wordlist)
-        zzuf = "z" + random_str(6)
-        response_3 = requester(request, {zzuf[:-1]: zzuf[::-1][:-1]})
-        while True:
-            reason = compare(response_3, factors, {zzuf[:-1]: zzuf[::-1][:-1]})[2]
-            if not reason:
-                break
-            factors[reason] = None
+
+        for _ in range(2):
+            zzuf = "z" + random_str(6)
+            resp_extra = requester(request, {zzuf[:-1]: zzuf[::-1][:-1]})
+            if type(resp_extra) != str:
+                reason = compare(resp_extra, factors, {zzuf[:-1]: zzuf[::-1][:-1]})[2]
+                if reason:
+                    factors[reason] = None
+
         if found:
             num = len(found)
             if words_exist:
@@ -164,30 +201,54 @@ def initialize(request, wordlist, single_url=False):
         populated = populate(wordlist)
         with open(f'{arjun_dir}/db/special.json', 'r') as f:
             populated.update(json.load(f))
-        param_groups = slicer(populated, int(len(wordlist)/mem.var['chunks']))
-        prev_chunk_count = len(param_groups)
-        last_params = []
-        while True:
-            param_groups = narrower(request, factors, param_groups)
-            if len(param_groups) > prev_chunk_count:
-                response_3 = requester(request, {zzuf[:-1]: zzuf[::-1][:-1]})
-                if compare(response_3, factors, {zzuf[:-1]: zzuf[::-1][:-1]})[0] != '':
-                    print('%s Webpage is returning different content on each request. Skipping.' % bad)
-                    return []
-            if mem.var['kill']:
-                return 'skipped'
-            param_groups = confirm(param_groups, last_params)
-            prev_chunk_count = len(param_groups)
-            if not param_groups:
-                break
+
+        if mem.var['chunks'] is not None:
+            chunk_size = mem.var['chunks']
+        else:
+            if single_url:
+                print('%s Auto-detecting optimal chunk size' % run)
+            chunk_size = detect_chunk_size(request, factors)
+            if single_url:
+                print('%s Optimal chunk size: %d params/request' % (info, chunk_size))
+
+        if len(wordlist) < chunk_size:
+            chunk_size = max(int(len(wordlist) / 2), 1)
+
+        num_groups = max(len(populated) // chunk_size, 1)
+        param_groups = slicer(populated, num_groups)
+
+        found_params = narrower(request, factors, param_groups)
+
+        if mem.var['kill']:
+            return 'skipped'
+
+        if len(found_params) > len(param_groups) * 0.3:
+            zzuf = "z" + random_str(6)
+            resp_check = requester(request, {zzuf[:-1]: zzuf[::-1][:-1]})
+            if type(resp_check) != str and compare(resp_check, factors, {zzuf[:-1]: zzuf[::-1][:-1]})[0] != '':
+                print('%s Webpage is returning different content on each request. Skipping.' % bad)
+                return []
+
+        seen = set()
+        unique_params = []
+        for p in found_params:
+            name = list(p.keys())[0]
+            if name not in seen:
+                seen.add(name)
+                unique_params.append(p)
+
         confirmed_params = []
-        for param in last_params:
+        for param in unique_params:
             reason = bruter(request, factors, param, mode='verify')
             if reason:
                 name = list(param.keys())[0]
-                confirmed_params.append(name)
-                if single_url:
-                    print('%s parameter detected: %s, based on: %s' % (res, name, reason))
+                fake_name = name + random_str(3)
+                fake_param = {fake_name: list(param.values())[0]}
+                false_positive = bruter(request, factors, fake_param, mode='verify')
+                if not false_positive:
+                    confirmed_params.append(name)
+                    if single_url:
+                        print('%s parameter detected: %s, based on: %s' % (res, name, reason))
         return confirmed_params
 
 
